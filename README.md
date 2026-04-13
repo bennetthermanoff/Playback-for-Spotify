@@ -1,6 +1,7 @@
 # Playback for Spotify
 
 Control Spotify from your Pebble smartwatch. Browse playlists, artists, albums and liked songs, skip tracks, adjust volume, and see album art — all from your wrist.
+[Repebble AppStore link](https://apps.repebble.com/cd7c4d5fe7ec4989a64976c6)
 
 ![basalt menu](screenshots/basalt_1_menu.png) ![basalt now playing](screenshots/basalt_2_adele.png) ![basalt now playing 2](screenshots/basalt_3_weeknd.png)
 
