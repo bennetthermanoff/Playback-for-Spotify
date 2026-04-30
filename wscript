@@ -4,6 +4,9 @@
 # Feel free to customize this to your needs.
 #
 import os.path
+import os
+import json
+import re
 
 top = '.'
 out = 'build'
@@ -25,6 +28,25 @@ def configure(ctx):
 
 def build(ctx):
     ctx.load('pebble_sdk')
+
+    # Generate src/pkjs/debug_env.js from .env if it exists.
+    # The file is gitignored; delete it or omit .env for store builds.
+    debug_js_path = os.path.join('src', 'pkjs', 'debug_env.js')
+    debug_response = None
+    env_path = '.env'
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            for line in f:
+                m = re.match(r'DEBUG_RESPONSE\s*=\s*(.+)', line.rstrip())
+                if m:
+                    debug_response = m.group(1)
+                    break
+    with open(debug_js_path, 'w') as f:
+        if debug_response:
+            f.write('// Auto-generated from .env — do not commit\n')
+            f.write('var _DEBUG_RESPONSE = {};\n'.format(json.dumps(debug_response)))
+        else:
+            f.write('// No .env debug config — DEBUG_RESPONSE will be null\n')
 
     build_worker = os.path.exists('worker_src')
     binaries = []
