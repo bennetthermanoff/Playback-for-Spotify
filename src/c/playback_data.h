@@ -22,6 +22,7 @@ typedef enum {
   CMD_TOGGLE_SHUFFLE     = 24,
   CMD_CYCLE_REPEAT       = 25,
   CMD_QUEUE_ADD          = 26,
+  CMD_QUEUE_SKIP_TO      = 27, // skip forward N tracks to reach a queue position
   CMD_FETCH_ART          = 30,
 } AppCommand;
 

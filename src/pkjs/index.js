@@ -407,6 +407,23 @@ function handleCommand(cmd, context) {
         });
       }
       break;
+    case 27: // CMD_QUEUE_SKIP_TO — skip forward N tracks to reach a queue position
+      if (context) {
+        var n = parseInt(context, 10);
+        if (!isNaN(n) && n > 0) {
+          (function skipNext(remaining) {
+            api.nextTrack(function() {
+              if (remaining <= 1) {
+                startPolling();
+                setTimeout(fetchNowPlaying, 500);
+              } else {
+                skipNext(remaining - 1);
+              }
+            });
+          })(n);
+        }
+      }
+      break;
     case 30: // CMD_FETCH_ART
       if (context) imageTransfer.sendImageFromUrl(context);
       break;

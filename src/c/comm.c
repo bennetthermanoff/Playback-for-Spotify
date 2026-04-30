@@ -2,7 +2,8 @@
 
 static CommCallbacks s_callbacks;
 
-static GBitmap *s_art_bitmap = NULL;
+static GBitmap *s_art_bitmap = NULL;       // displayed (complete) art
+static GBitmap *s_art_pending = NULL;      // in-progress incoming art
 static uint8_t *s_art_data = NULL;
 static uint32_t s_image_data_size = 0;
 static uint16_t s_total_chunks = 0;
@@ -66,23 +67,23 @@ static void handle_image_header(DictionaryIterator *iter) {
   APP_LOG(APP_LOG_LEVEL_INFO, "Image header: %dx%d, %lu bytes, %d chunks",
           width, height, (unsigned long)data_size, total_chunks);
 
-  if (s_art_bitmap) {
-    gbitmap_destroy(s_art_bitmap);
-    s_art_bitmap = NULL;
+  if (s_art_pending) {
+    gbitmap_destroy(s_art_pending);
+    s_art_pending = NULL;
     s_art_data = NULL;
   }
 
   GBitmapFormat fmt = PBL_IF_COLOR_ELSE(GBitmapFormat8Bit, GBitmapFormat1Bit);
-  s_art_bitmap = gbitmap_create_blank(GSize(width, height), fmt);
-  if (!s_art_bitmap) {
+  s_art_pending = gbitmap_create_blank(GSize(width, height), fmt);
+  if (!s_art_pending) {
     APP_LOG(APP_LOG_LEVEL_ERROR, "Failed to allocate bitmap %dx%d", width, height);
     if (s_callbacks.on_status) s_callbacks.on_status("Error: no memory");
     return;
   }
 
-  s_art_data = gbitmap_get_data(s_art_bitmap);
+  s_art_data = gbitmap_get_data(s_art_pending);
   // Use actual bitmap capacity, not JS-reported size
-  uint16_t row_bytes = gbitmap_get_bytes_per_row(s_art_bitmap);
+  uint16_t row_bytes = gbitmap_get_bytes_per_row(s_art_pending);
   s_image_data_size = (uint32_t)row_bytes * height;
   s_total_chunks = total_chunks;
   s_received_chunks = 0;
@@ -101,7 +102,7 @@ static void handle_image_chunk(DictionaryIterator *iter) {
     return;
   }
 
-  if (!s_art_bitmap || !s_art_data) {
+  if (!s_art_pending || !s_art_data) {
     APP_LOG(APP_LOG_LEVEL_ERROR, "Chunk received but no bitmap allocated");
     return;
   }
@@ -130,7 +131,13 @@ static void handle_image_chunk(DictionaryIterator *iter) {
   if (s_received_chunks >= s_total_chunks) {
     APP_LOG(APP_LOG_LEVEL_INFO, "Image complete! %lu bytes received",
             (unsigned long)s_bytes_received);
-    if (s_callbacks.on_status) s_callbacks.on_status("Art loaded!");
+    // Swap pending → displayed, discard the old art.
+    if (s_art_bitmap) {
+      gbitmap_destroy(s_art_bitmap);
+    }
+    s_art_bitmap = s_art_pending;
+    s_art_pending = NULL;
+    s_art_data = NULL;
     if (s_callbacks.on_image_ready) s_callbacks.on_image_ready(s_art_bitmap);
   }
 }
@@ -310,6 +317,10 @@ void comm_init(CommCallbacks callbacks) {
 
 void comm_deinit(void) {
   app_message_deregister_callbacks();
+  if (s_art_pending) {
+    gbitmap_destroy(s_art_pending);
+    s_art_pending = NULL;
+  }
   if (s_art_bitmap) {
     gbitmap_destroy(s_art_bitmap);
     s_art_bitmap = NULL;

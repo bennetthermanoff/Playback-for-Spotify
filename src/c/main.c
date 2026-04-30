@@ -18,6 +18,10 @@ static bool s_shuffle = false;
 static int s_repeat_state = 0; // 0=off, 1=context, 2=track
 static AppTimer *s_tick_timer = NULL;
 
+// Current track info (cached to populate queue row 0)
+static char s_current_title[40] = "";
+static char s_current_artist[32] = "";
+
 // Exposed for the More submenu (more.c) so it can show the current
 // shuffle/repeat state on open without re-fetching.
 bool main_get_shuffle(void) { return s_shuffle; }
@@ -72,6 +76,11 @@ static void track_info_cb(const char *title, const char *artist,
   s_playing = is_playing;
   s_shuffle = shuffle;
   s_repeat_state = repeat_state;
+
+  strncpy(s_current_title, title, sizeof(s_current_title) - 1);
+  s_current_title[sizeof(s_current_title) - 1] = '\0';
+  strncpy(s_current_artist, artist, sizeof(s_current_artist) - 1);
+  s_current_artist[sizeof(s_current_artist) - 1] = '\0';
 
   // Update Now Playing UI (no-ops if window not showing)
   APP_LOG(APP_LOG_LEVEL_DEBUG, "track_info_cb: ui update");
@@ -169,17 +178,35 @@ static void mode_changed_cb(ControlMode mode) {
   }
 }
 
+// --- Now Playing window click config ---
+
+static void np_up_click(ClickRecognizerRef r, void *ctx) {
+  comm_send_command(CMD_PREV_TRACK, NULL);
+}
+
+static void np_down_click(ClickRecognizerRef r, void *ctx) {
+  comm_send_command(CMD_NEXT_TRACK, NULL);
+}
+
+static void np_select_click(ClickRecognizerRef r, void *ctx) {
+  list_set_queue_current_track(s_current_title, s_current_artist);
+  list_window_push(LIST_TYPE_QUEUE);
+  comm_send_command(CMD_FETCH_QUEUE, NULL);
+  list_set_auto_dismiss(QUEUE_TIMEOUT_MS);
+}
+
+static void np_click_config_provider(void *context) {
+  window_single_click_subscribe(BUTTON_ID_UP, np_up_click);
+  window_single_click_subscribe(BUTTON_ID_DOWN, np_down_click);
+  window_single_click_subscribe(BUTTON_ID_SELECT, np_select_click);
+}
+
 // --- Now Playing window (pushed from menu) ---
 
 static void np_window_load(Window *window) {
   s_np_visible = true;
   ui_init(window);
-  window_set_click_config_provider(window, controls_click_config_provider);
-  // Repaint the last-known album art into the freshly created bitmap
-  // layer. Without this, reopening Now Playing for the same track
-  // shows a blank cover until JS happens to push a new URL (e.g. the
-  // user hits next/previous), because the JS side de-dupes on URL and
-  // doesn't retransmit unchanged art.
+  window_set_click_config_provider(window, np_click_config_provider);
   GBitmap *cached = comm_get_cached_art();
   if (cached) {
     ui_set_album_art(cached);
@@ -222,6 +249,10 @@ static void init(void) {
   comm_init(cbs);
   controls_init(music_command_cb, mode_changed_cb);
   menu_window_push();
+
+  if (launch_reason() == APP_LAUNCH_QUICK_LAUNCH) {
+    now_playing_window_push();
+  }
 
   if (tutorial_needed()) {
     tutorial_show(tutorial_done);

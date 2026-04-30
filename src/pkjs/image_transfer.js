@@ -4,7 +4,7 @@ function getChunkSize() {
   try {
     var platform = Pebble.getActiveWatchInfo().platform || '';
     if (platform === 'basalt' || platform === 'emery' || platform === 'gabbro') return 2000;
-  } catch (e) {}
+  } catch (e) { }
   return 1000;
 }
 
@@ -24,7 +24,7 @@ function sendError(msg) {
   console.log('[playback] ERROR: ' + msg);
   try {
     Pebble.sendAppMessage({ 'ErrorMsg': msg });
-  } catch (e) {}
+  } catch (e) { }
 }
 
 function arrayBufferToBytes(ab) {
@@ -65,7 +65,7 @@ function resizeAndDither(srcPixels, srcW, srcH, dstW, dstH) {
       var lum = 0;
       if (srcX >= 0 && srcX < srcW && srcY >= 0 && srcY < srcH) {
         var srcIdx = (srcY * srcW + srcX) * 4;
-        lum = 0.299 * srcPixels[srcIdx] + 0.587 * srcPixels[srcIdx+1] + 0.114 * srcPixels[srcIdx+2];
+        lum = 0.299 * srcPixels[srcIdx] + 0.587 * srcPixels[srcIdx + 1] + 0.114 * srcPixels[srcIdx + 2];
       }
       gray[y * dstW + x] = lum;
     }
@@ -112,7 +112,7 @@ function resizeAndQuantizeFit(srcPixels, srcW, srcH, dstW, dstH) {
       var srcY = Math.floor((y - offsetY) / scale);
       if (srcX >= 0 && srcX < srcW && srcY >= 0 && srcY < srcH) {
         var srcIdx = (srcY * srcW + srcX) * 4;
-        var r = srcPixels[srcIdx], g = srcPixels[srcIdx+1], b = srcPixels[srcIdx+2];
+        var r = srcPixels[srcIdx], g = srcPixels[srcIdx + 1], b = srcPixels[srcIdx + 2];
         dst[y * dstW + x] = 0xC0 | ((r >> 6) << 4) | ((g >> 6) << 2) | (b >> 6);
       }
     }
@@ -129,11 +129,11 @@ function processJpeg(jpegData) {
       if (platform === 'emery') { W = 200; H = 166; }
       else if (platform === 'gabbro') { W = 260; H = 260; isRound = true; }
       else if (platform === 'chalk') { W = 180; H = 180; isRound = true; }
-    } catch (e) {}
+    } catch (e) { }
 
     var imageData = isRound ? resizeAndQuantizeFit(raw.data, raw.width, raw.height, W, H)
-                 : isColorPlatform() ? resizeAndQuantize(raw.data, raw.width, raw.height, W, H)
-                 : resizeAndDither(raw.data, raw.width, raw.height, W, H);
+      : isColorPlatform() ? resizeAndQuantize(raw.data, raw.width, raw.height, W, H)
+        : resizeAndDither(raw.data, raw.width, raw.height, W, H);
 
     sendImageToWatch(imageData, W, H);
   } catch (ex) {
@@ -148,7 +148,7 @@ function downloadAndSend(url) {
   var xhr = new XMLHttpRequest();
   xhr.open('GET', url, true);
   xhr.responseType = 'arraybuffer';
-  xhr.onload = function() {
+  xhr.onload = function () {
     if (xhr.status === 200) {
       processJpeg(arrayBufferToBytes(xhr.response));
     } else {
@@ -158,7 +158,7 @@ function downloadAndSend(url) {
       sendError('Download ' + xhr.status);
     }
   };
-  xhr.onerror = function() {
+  xhr.onerror = function () {
     lastUrl = null;
     sendError('Download failed');
   };
@@ -175,9 +175,9 @@ function sendImageToWatch(data, width, height) {
     'ImageHeight': height,
     'ImageDataSize': data.length,
     'ImageChunksTotal': totalChunks
-  }, function() {
+  }, function () {
     sendChunk(data, 0, totalChunks, chunkSize);
-  }, function() {
+  }, function () {
     transferInProgress = false;
     lastUrl = null;
     sendError('Header fail');
@@ -187,7 +187,7 @@ function sendImageToWatch(data, width, height) {
 function sendChunk(data, index, totalChunks, chunkSize) {
   var start = index * chunkSize;
   var end = Math.min(start + chunkSize, data.length);
-  
+
   // Convert Uint8Array to standard Array for emulator compatibility
   var chunk = [];
   for (var i = start; i < end; i++) {
@@ -197,19 +197,19 @@ function sendChunk(data, index, totalChunks, chunkSize) {
   Pebble.sendAppMessage({
     'ImageChunkIndex': index,
     'ImageChunkData': chunk
-  }, function() {
+  }, function () {
     if (index + 1 < totalChunks) sendChunk(data, index + 1, totalChunks, chunkSize);
     else transferInProgress = false;
-  }, function() {
+  }, function () {
     // Retry once
-    setTimeout(function() {
+    setTimeout(function () {
       Pebble.sendAppMessage({
         'ImageChunkIndex': index,
         'ImageChunkData': chunk
-      }, function() {
+      }, function () {
         if (index + 1 < totalChunks) sendChunk(data, index + 1, totalChunks, chunkSize);
         else transferInProgress = false;
-      }, function() {
+      }, function () {
         transferInProgress = false;
         lastUrl = null;
         sendError('Chunk fail');
@@ -220,5 +220,5 @@ function sendChunk(data, index, totalChunks, chunkSize) {
 
 module.exports = {
   sendImageFromUrl: downloadAndSend,
-  isTransferring: function() { return transferInProgress; }
+  isTransferring: function () { return transferInProgress; }
 };

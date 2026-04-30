@@ -8,8 +8,6 @@ static TextLayer *s_time_layer;
 static Layer *s_overlay_layer;
 static Layer *s_progress_layer;
 #if defined(PBL_ROUND)
-// Shadow copies drawn 1px offset behind the main labels so white text
-// stays readable on top of the dithered album art.
 static MarqueeLayer *s_title_shadow_layer;
 static TextLayer *s_artist_shadow_layer;
 static TextLayer *s_time_shadow_layer;
@@ -18,12 +16,28 @@ static TextLayer *s_time_shadow_layer;
 static char s_title_buf[64];
 static char s_artist_buf[64];
 static char s_time_buf[24];
-static char s_status_buf_ui[64];
-static bool s_showing_status = false;
-static AppTimer *s_status_timer = NULL;
 static float s_progress = 0.0f;
 static bool s_shuffle_on = false;
 static int s_repeat_state = 0; // 0=off, 1=context, 2=track
+
+#define NP_MARQUEE_DURATION_MS 10000
+static AppTimer *s_marquee_timer = NULL;
+
+static void marquee_stop_cb(void *data) {
+  s_marquee_timer = NULL;
+  marquee_layer_stop(s_title_layer);
+#if defined(PBL_ROUND)
+  marquee_layer_stop(s_title_shadow_layer);
+#endif
+}
+
+static void reset_marquee_timer(void) {
+  if (s_marquee_timer) {
+    app_timer_reschedule(s_marquee_timer, NP_MARQUEE_DURATION_MS);
+  } else {
+    s_marquee_timer = app_timer_register(NP_MARQUEE_DURATION_MS, marquee_stop_cb, NULL);
+  }
+}
 
 // 8x8 shuffle icon — two crossing arrows, only drawn when shuffle is on.
 static void draw_shuffle_icon(GContext *ctx, int x, int y) {
@@ -56,29 +70,12 @@ static void draw_repeat_icon(GContext *ctx, int x, int y, int state) {
   }
 }
 
-static void status_clear_cb(void *data) {
-  s_status_timer = NULL;
-  s_showing_status = false;
-  text_layer_set_text(s_time_layer, s_time_buf);
-  layer_mark_dirty(text_layer_get_layer(s_time_layer));
-#if defined(PBL_ROUND)
-  if (s_time_shadow_layer) {
-    text_layer_set_text(s_time_shadow_layer, s_time_buf);
-    layer_mark_dirty(text_layer_get_layer(s_time_shadow_layer));
-  }
-#endif
-}
-
 static void overlay_update_proc(Layer *layer, GContext *ctx) {
   GRect bounds = layer_get_bounds(layer);
 #if defined(PBL_ROUND)
-  // 75% dither over the album art: draw black on 3 of every 4 pixels,
-  // leaving 1 of 4 transparent so the art bleeds through as a darkened
-  // background. Text drawn on top still reads clearly.
   graphics_context_set_stroke_color(ctx, GColorBlack);
   for (int y = 0; y < bounds.size.h; y++) {
     for (int x = 0; x < bounds.size.w; x++) {
-      // Keep every (even, even) pixel untouched; paint the other 3.
       if ((x & 1) || (y & 1)) {
         graphics_draw_pixel(ctx, GPoint(x, y));
       }
@@ -89,9 +86,6 @@ static void overlay_update_proc(Layer *layer, GContext *ctx) {
   graphics_fill_rect(ctx, bounds, 0, GCornerNone);
 #endif
 
-  // Shuffle/repeat icons in the bottom-right corner of the overlay.
-  // Rectangular-only — round displays are too tight with the current
-  // overlay layout to fit extra glyphs without clobbering the time.
 #if !defined(PBL_ROUND)
   int icon_y = bounds.size.h - 12;
   if (s_shuffle_on) {
@@ -102,7 +96,6 @@ static void overlay_update_proc(Layer *layer, GContext *ctx) {
   }
 #endif
 }
-
 
 static void progress_update_proc(Layer *layer, GContext *ctx) {
   GRect bounds = layer_get_bounds(layer);
@@ -269,13 +262,10 @@ void ui_init(Window *window) {
 #endif
 
   snprintf(s_time_buf, sizeof(s_time_buf), "0:00 / 0:00");
+  reset_marquee_timer();
 }
 
 void ui_deinit(void) {
-  if (s_status_timer) {
-    app_timer_cancel(s_status_timer);
-    s_status_timer = NULL;
-  }
   text_layer_destroy(s_time_layer);
   s_time_layer = NULL;
 #if defined(PBL_ROUND)
@@ -300,6 +290,10 @@ void ui_deinit(void) {
   s_overlay_layer = NULL;
   bitmap_layer_destroy(s_art_layer);
   s_art_layer = NULL;
+  if (s_marquee_timer) {
+    app_timer_cancel(s_marquee_timer);
+    s_marquee_timer = NULL;
+  }
 }
 
 void ui_set_album_art(GBitmap *bitmap) {
@@ -309,19 +303,7 @@ void ui_set_album_art(GBitmap *bitmap) {
 }
 
 void ui_set_status(const char *text) {
-  strncpy(s_status_buf_ui, text, sizeof(s_status_buf_ui) - 1);
-  s_status_buf_ui[sizeof(s_status_buf_ui) - 1] = '\0';
-  s_showing_status = true;
-
-  if (!s_time_layer) return;
-  text_layer_set_text(s_time_layer, s_status_buf_ui);
-#if defined(PBL_ROUND)
-  if (s_time_shadow_layer) text_layer_set_text(s_time_shadow_layer, s_status_buf_ui);
-#endif
-
-  // Auto-clear status after 3 seconds
-  if (s_status_timer) app_timer_cancel(s_status_timer);
-  s_status_timer = app_timer_register(3000, status_clear_cb, NULL);
+  (void)text; // Status is not shown in the Now Playing UI
 }
 
 void ui_set_track_info(const char *title, const char *artist) {
@@ -335,14 +317,13 @@ void ui_set_track_info(const char *title, const char *artist) {
   text_layer_set_text(s_artist_layer, s_artist_buf);
   layer_mark_dirty(text_layer_get_layer(s_artist_layer));
 #if defined(PBL_ROUND)
-  // Keep shadow copies in sync so the darker glyph sits 1 px offset
-  // behind the white one.
   if (s_title_shadow_layer)  marquee_layer_set_text(s_title_shadow_layer, s_title_buf);
   if (s_artist_shadow_layer) {
     text_layer_set_text(s_artist_shadow_layer, s_artist_buf);
     layer_mark_dirty(text_layer_get_layer(s_artist_shadow_layer));
   }
 #endif
+  reset_marquee_timer();
 }
 
 void ui_set_shuffle(bool on) {
@@ -369,14 +350,12 @@ void ui_set_progress(int elapsed_sec, int total_sec) {
   if (!s_progress_layer) return;
   layer_mark_dirty(s_progress_layer);
 
-  if (!s_showing_status) {
-    text_layer_set_text(s_time_layer, s_time_buf);
-    layer_mark_dirty(text_layer_get_layer(s_time_layer));
+  text_layer_set_text(s_time_layer, s_time_buf);
+  layer_mark_dirty(text_layer_get_layer(s_time_layer));
 #if defined(PBL_ROUND)
-    if (s_time_shadow_layer) {
-      text_layer_set_text(s_time_shadow_layer, s_time_buf);
-      layer_mark_dirty(text_layer_get_layer(s_time_shadow_layer));
-    }
-#endif
+  if (s_time_shadow_layer) {
+    text_layer_set_text(s_time_shadow_layer, s_time_buf);
+    layer_mark_dirty(text_layer_get_layer(s_time_shadow_layer));
   }
+#endif
 }
