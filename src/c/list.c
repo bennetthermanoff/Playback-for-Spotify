@@ -189,12 +189,8 @@ static void draw_row(GContext *ctx, const Layer *cell_layer, MenuIndex *cell_ind
     int row = cell_index->row;
     if (row == 0) {
       const char *sub = s_queue_current_artist[0] ? s_queue_current_artist : NULL;
-      if (row == s_marquee_row && s_row_marquee.overflows) {
-        draw_scrolling_row(ctx, cell_layer, sub);
-      } else {
-        const char *title = s_queue_current_title[0] ? s_queue_current_title : "Now Playing";
-        menu_cell_basic_draw(ctx, cell_layer, title, sub, NULL);
-      }
+      const char *title = s_queue_current_title[0] ? s_queue_current_title : "Now Playing";
+      menu_cell_basic_draw(ctx, cell_layer, title, sub, NULL);
       return;
     }
     int item_row = row - 1;
@@ -203,11 +199,7 @@ static void draw_row(GContext *ctx, const Layer *cell_layer, MenuIndex *cell_ind
       return;
     }
     const char *subtitle = s_items[item_row].subtitle[0] ? s_items[item_row].subtitle : NULL;
-    if (row == s_marquee_row && s_row_marquee.overflows) {
-      draw_scrolling_row(ctx, cell_layer, subtitle);
-    } else {
-      menu_cell_basic_draw(ctx, cell_layer, s_items[item_row].title, subtitle, NULL);
-    }
+    menu_cell_basic_draw(ctx, cell_layer, s_items[item_row].title, subtitle, NULL);
     return;
   }
 
