@@ -6,18 +6,21 @@ static BitmapLayer *s_art_layer;
 static MarqueeLayer *s_title_layer;
 static TextLayer *s_artist_layer;
 static TextLayer *s_time_layer;
+static TextLayer *s_clock_layer;
 static Layer *s_overlay_layer;
 static Layer *s_progress_layer;
 #if defined(PBL_ROUND)
 static MarqueeLayer *s_title_shadow_layer;
 static TextLayer *s_artist_shadow_layer;
 static TextLayer *s_time_shadow_layer;
+static TextLayer *s_clock_shadow_layer;
 #endif
 
 static char s_title_pending[64];    // incoming title (shown at animation midpoint)
 static char s_artist_buf[64];       // incoming artist (written by ui_set_track_info)
 static char s_artist_display_buf[64]; // artist shown on screen (pointer held by TextLayer)
 static char s_time_buf[24];
+static char s_clock_buf[8];
 static float s_progress = 0.0f;
 static bool s_shuffle_on = false;
 static int s_repeat_state = 0; // 0=off, 1=context, 2=track
@@ -25,6 +28,29 @@ static int s_repeat_state = 0; // 0=off, 1=context, 2=track
 #define NP_MARQUEE_DURATION_MS 10000
 static AppTimer *s_marquee_timer = NULL;
 static void reset_marquee_timer(void);  // forward declaration (defined below draw helpers)
+
+// ── Clock ───────────────────────────────────────────────────────────
+static void update_clock_from_tm(struct tm *t) {
+  strftime(s_clock_buf, sizeof(s_clock_buf),
+           clock_is_24h_style() ? "%H:%M" : "%I:%M", t);
+  // Strip leading zero in 12h mode ("09:30" → "9:30")
+  if (!clock_is_24h_style() && s_clock_buf[0] == '0') {
+    memmove(s_clock_buf, s_clock_buf + 1, strlen(s_clock_buf));
+  }
+  if (s_clock_layer) text_layer_set_text(s_clock_layer, s_clock_buf);
+#if defined(PBL_ROUND)
+  if (s_clock_shadow_layer) text_layer_set_text(s_clock_shadow_layer, s_clock_buf);
+#endif
+}
+
+static void clock_tick_handler(struct tm *tick_time, TimeUnits units_changed) {
+  update_clock_from_tm(tick_time);
+}
+
+static void update_clock(void) {
+  time_t now = time(NULL);
+  update_clock_from_tm(localtime(&now));
+}
 
 // ── Loading / "no track" deferred display ────────────────────────────────
 #define NO_TRACK_TIMEOUT_MS  5000
@@ -352,11 +378,17 @@ static void overlay_update_proc(Layer *layer, GContext *ctx) {
 
 #if !defined(PBL_ROUND)
   int icon_y = bounds.size.h - 12;
+  GSize time_size = graphics_text_layout_get_content_size(
+      s_time_buf, fonts_get_system_font(FONT_KEY_GOTHIC_14),
+      GRect(0, 0, bounds.size.w, bounds.size.h),
+      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft);
+  int icon_x = 4 + time_size.w + 4; // 4px left margin + text + 4px gap
   if (s_shuffle_on) {
-    draw_shuffle_icon(ctx, bounds.size.w - 22, icon_y);
+    draw_shuffle_icon(ctx, icon_x, icon_y);
+    icon_x += 11;
   }
   if (s_repeat_state > 0) {
-    draw_repeat_icon(ctx, bounds.size.w - 11, icon_y, s_repeat_state);
+    draw_repeat_icon(ctx, icon_x, icon_y, s_repeat_state);
   }
 #endif
 }
@@ -495,6 +527,24 @@ void ui_init(Window *window) {
   text_layer_set_text(s_time_layer, "0:00 / 0:00");
   layer_add_child(s_overlay_layer, text_layer_get_layer(s_time_layer));
 
+  int clock_w = 38;
+  int clock_x = W - text_inset - clock_w;
+  s_clock_shadow_layer = text_layer_create(GRect(clock_x + 1, time_y + 1, clock_w, time_h));
+  text_layer_set_background_color(s_clock_shadow_layer, GColorClear);
+  text_layer_set_text_color(s_clock_shadow_layer, GColorBlack);
+  text_layer_set_font(s_clock_shadow_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
+  text_layer_set_text_alignment(s_clock_shadow_layer, GTextAlignmentRight);
+  text_layer_set_text(s_clock_shadow_layer, s_clock_buf);
+  layer_add_child(s_overlay_layer, text_layer_get_layer(s_clock_shadow_layer));
+
+  s_clock_layer = text_layer_create(GRect(clock_x, time_y, clock_w, time_h));
+  text_layer_set_background_color(s_clock_layer, GColorClear);
+  text_layer_set_text_color(s_clock_layer, GColorWhite);
+  text_layer_set_font(s_clock_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
+  text_layer_set_text_alignment(s_clock_layer, GTextAlignmentRight);
+  text_layer_set_text(s_clock_layer, s_clock_buf);
+  layer_add_child(s_overlay_layer, text_layer_get_layer(s_clock_layer));
+
 #else
   // Original Rectangular Layout
   int overlay_h = 62;
@@ -529,12 +579,20 @@ void ui_init(Window *window) {
   layer_set_update_proc(s_progress_layer, progress_update_proc);
   layer_add_child(s_overlay_layer, s_progress_layer);
 
-  s_time_layer = text_layer_create(GRect(4, 44, W - 8, 16));
+  s_time_layer = text_layer_create(GRect(4, 44, W - 48, 16));
   text_layer_set_background_color(s_time_layer, GColorClear);
   text_layer_set_text_color(s_time_layer, GColorLightGray);
   text_layer_set_font(s_time_layer, fonts_get_system_font(FONT_KEY_GOTHIC_14));
   text_layer_set_text(s_time_layer, "0:00 / 0:00");
   layer_add_child(s_overlay_layer, text_layer_get_layer(s_time_layer));
+
+  s_clock_layer = text_layer_create(GRect(W - 40, 42, 36, 20));
+  text_layer_set_background_color(s_clock_layer, GColorClear);
+  text_layer_set_text_color(s_clock_layer, GColorWhite);
+  text_layer_set_font(s_clock_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
+  text_layer_set_text_alignment(s_clock_layer, GTextAlignmentRight);
+  text_layer_set_text(s_clock_layer, s_clock_buf);
+  layer_add_child(s_overlay_layer, text_layer_get_layer(s_clock_layer));
 #endif
 
   snprintf(s_time_buf, sizeof(s_time_buf), "0:00 / 0:00");
@@ -550,6 +608,8 @@ void ui_init(Window *window) {
 #endif
 
   reset_marquee_timer();
+  update_clock();
+  tick_timer_service_subscribe(MINUTE_UNIT, clock_tick_handler);
 }
 
 void ui_deinit(void) {
@@ -560,6 +620,13 @@ void ui_deinit(void) {
   if (s_art_anim) {
     animation_unschedule(s_art_anim);
   }
+  tick_timer_service_unsubscribe();
+  text_layer_destroy(s_clock_layer);
+  s_clock_layer = NULL;
+#if defined(PBL_ROUND)
+  text_layer_destroy(s_clock_shadow_layer);
+  s_clock_shadow_layer = NULL;
+#endif
   text_layer_destroy(s_time_layer);
   s_time_layer = NULL;
 #if defined(PBL_ROUND)
