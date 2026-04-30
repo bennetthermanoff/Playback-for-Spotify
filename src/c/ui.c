@@ -1,4 +1,5 @@
 #include "ui.h"
+#include "comm.h"
 #include "marquee.h"
 
 static BitmapLayer *s_art_layer;
@@ -13,8 +14,9 @@ static TextLayer *s_artist_shadow_layer;
 static TextLayer *s_time_shadow_layer;
 #endif
 
-static char s_title_buf[64];
-static char s_artist_buf[64];
+static char s_title_pending[64];    // incoming title (shown at animation midpoint)
+static char s_artist_buf[64];       // incoming artist (written by ui_set_track_info)
+static char s_artist_display_buf[64]; // artist shown on screen (pointer held by TextLayer)
 static char s_time_buf[24];
 static float s_progress = 0.0f;
 static bool s_shuffle_on = false;
@@ -22,6 +24,265 @@ static int s_repeat_state = 0; // 0=off, 1=context, 2=track
 
 #define NP_MARQUEE_DURATION_MS 10000
 static AppTimer *s_marquee_timer = NULL;
+static void reset_marquee_timer(void);  // forward declaration (defined below draw helpers)
+
+// ── Loading / "no track" deferred display ────────────────────────────────
+#define NO_TRACK_TIMEOUT_MS  5000
+#define TEXT_DEBOUNCE_MS      200   // batch rapid consecutive ui_set_track_info calls
+static AppTimer *s_no_track_timer    = NULL;
+static AppTimer *s_text_debounce_timer = NULL;
+static bool s_track_received = false;
+
+// ── Slide + spring transition ─────────────────────────────────────────────
+#define TEXT_TRANSITION_MS 450
+#define ART_TRANSITION_MS  450
+
+// Home rects captured once in ui_init (overlay-local for text, root-local for art)
+static int     s_screen_w;
+static GRect   s_title_home;
+static GRect   s_artist_home;
+static GRect   s_art_home;
+#if defined(PBL_ROUND)
+static GRect   s_title_shadow_home;
+static GRect   s_artist_shadow_home;
+#endif
+
+static bool       s_text_mid_done;
+static GBitmap   *s_art_pending_bmp;
+static bool       s_art_mid_done;
+static Animation *s_text_anim;
+static Animation *s_art_anim;
+
+// ── Moook animation curve (ported from Pebble OS) ────────────────────────
+// The Moook curve is a frame-table animation used throughout the Pebble OS UI.
+// EXIT: ease-in quadratic slide off-screen left.
+// ENTER: start at off-screen right, linear approach, then Moook-out bounce at home.
+//   frames_in  = {0}         — start exactly at from (off-screen right)
+//   mid frames = 2           — linear approach from off-right to near-home
+//   frames_out = {8,4,2,1,0} — overshoot left then settle (characteristic Moook bounce)
+#define MOOOK_FRAME_MS         33   // ANIMATION_TARGET_FRAME_INTERVAL_MS
+#define MOOOK_BOUNCE           4
+#define MOOOK_BOUNCE_EXT       (MOOOK_BOUNCE * 2)
+#define MOOOK_EXIT_FRAMES      3    // exit: 3 frames ease-in
+#define MOOOK_ENTER_MID_FRAMES 2    // enter: mid linear-approach frames
+
+static const int32_t s_moook_enter_in[]  = {0};
+static const int32_t s_moook_enter_out[] = {MOOOK_BOUNCE_EXT, MOOOK_BOUNCE, 2, 1, 0};
+
+#define MOOOK_ENTER_IN_FRAMES  ((int)ARRAY_LENGTH(s_moook_enter_in))
+#define MOOOK_ENTER_OUT_FRAMES ((int)ARRAY_LENGTH(s_moook_enter_out))
+#define MOOOK_ENTER_FRAMES     (MOOOK_ENTER_IN_FRAMES + MOOOK_ENTER_MID_FRAMES \
+                                + MOOOK_ENTER_OUT_FRAMES)
+#define MOOOK_TOTAL_FRAMES     (MOOOK_EXIT_FRAMES + MOOOK_ENTER_FRAMES)
+
+#undef TEXT_TRANSITION_MS
+#undef ART_TRANSITION_MS
+#define TEXT_TRANSITION_MS     (MOOOK_TOTAL_FRAMES * MOOOK_FRAME_MS)
+#define ART_TRANSITION_MS      TEXT_TRANSITION_MS
+
+// Normalized threshold where exit ends and enter begins (0..ANIMATION_NORMALIZED_MAX)
+#define MOOOK_EXIT_THRESHOLD \
+  ((int32_t)((int64_t)MOOOK_EXIT_FRAMES * ANIMATION_NORMALIZED_MAX / MOOOK_TOTAL_FRAMES))
+
+// Map normalized 0..MAX to frame index 0..num_frames-1, with half-frame rounding.
+static int32_t prv_moook_frame(int32_t normalized, int32_t num_frames) {
+  int32_t MAX = ANIMATION_NORMALIZED_MAX;
+  int32_t idx = (int32_t)(((int64_t)normalized * num_frames
+                            + MAX / (2 * num_frames)) / MAX);
+  return (idx < 0) ? 0 : (idx >= num_frames) ? num_frames - 1 : idx;
+}
+
+// Return delta from home for the ENTER phase.
+//   Positive dx → layer is right of home (approaching from off-screen right).
+//   Negative dx → layer is left of home  (Moook overshoot, then settle to 0).
+// from_dx: initial right-of-home offset = s_screen_w + 10 (off-screen right).
+static int32_t moook_enter_dx(int32_t normalized, int32_t from_dx) {
+  int32_t MAX        = ANIMATION_NORMALIZED_MAX;
+  int32_t num_total  = MOOOK_ENTER_FRAMES;
+  if (normalized >= MAX) return 0;
+
+  int32_t frame = prv_moook_frame(normalized, num_total);
+
+  if (frame < MOOOK_ENTER_IN_FRAMES) {
+    // in-frame: layer sits at from_dx (s_moook_enter_in[0] = 0, direction = -1)
+    return from_dx;
+  } else if (frame < MOOOK_ENTER_IN_FRAMES + MOOOK_ENTER_MID_FRAMES) {
+    // mid: linear approach from from_dx to the first out-frame target
+    // first out-frame target = 0 + direction_out * out[0]
+    //   direction_out = -1 (bounce_back = true: overshoot in direction of travel)
+    //   → target = -s_moook_enter_out[0]
+    int32_t shifted  = normalized
+                       - (int32_t)(((int64_t)MOOOK_ENTER_IN_FRAMES * MAX) / num_total);
+    int32_t mid_norm = (int32_t)(((int64_t)num_total * shifted) / MOOOK_ENTER_MID_FRAMES);
+    int32_t end      = -s_moook_enter_out[0]; // overshoot target
+    return from_dx + (int32_t)((int64_t)(end - from_dx) * mid_norm / MAX);
+  } else {
+    // out-frames: overshoot then settle — direction_out = -1
+    int32_t out_i = frame - MOOOK_ENTER_IN_FRAMES - MOOOK_ENTER_MID_FRAMES;
+    return -s_moook_enter_out[out_i];
+  }
+}
+
+// ── Text layers ──────────────────────────────────────────────────────────
+
+static void set_text_x_delta(int32_t dx) {
+  GRect r;
+  if (s_title_layer) {
+    r = s_title_home; r.origin.x += dx;
+    layer_set_frame(marquee_layer_get_layer(s_title_layer), r);
+  }
+  if (s_artist_layer) {
+    r = s_artist_home; r.origin.x += dx;
+    layer_set_frame(text_layer_get_layer(s_artist_layer), r);
+  }
+#if defined(PBL_ROUND)
+  if (s_title_shadow_layer) {
+    r = s_title_shadow_home; r.origin.x += dx;
+    layer_set_frame(marquee_layer_get_layer(s_title_shadow_layer), r);
+  }
+  if (s_artist_shadow_layer) {
+    r = s_artist_shadow_home; r.origin.x += dx;
+    layer_set_frame(text_layer_get_layer(s_artist_shadow_layer), r);
+  }
+#endif
+}
+
+static void apply_text_content(void) {
+  // Copy incoming artist into the display buffer so the TextLayer pointer
+  // doesn't expose new content before the enter phase of the animation.
+  strncpy(s_artist_display_buf, s_artist_buf, sizeof(s_artist_display_buf) - 1);
+  s_artist_display_buf[sizeof(s_artist_display_buf) - 1] = '\0';
+
+  if (s_title_layer)  marquee_layer_set_text(s_title_layer,  s_title_pending);
+  if (s_artist_layer) text_layer_set_text(s_artist_layer, s_artist_display_buf);
+#if defined(PBL_ROUND)
+  if (s_title_shadow_layer)  marquee_layer_set_text(s_title_shadow_layer,  s_title_pending);
+  if (s_artist_shadow_layer) text_layer_set_text(s_artist_shadow_layer, s_artist_display_buf);
+#endif
+  reset_marquee_timer();
+}
+
+static void text_anim_update(Animation *anim, const AnimationProgress progress) {
+  int32_t t   = (int32_t)progress;
+  int32_t MAX = ANIMATION_NORMALIZED_MAX;
+
+  if (t <= MOOOK_EXIT_THRESHOLD) {
+    // EXIT: ease-in quadratic slide off left
+    int32_t exit_t = (MOOOK_EXIT_THRESHOLD > 0)
+                     ? (int32_t)((int64_t)t * MAX / MOOOK_EXIT_THRESHOLD) : MAX;
+    int32_t eased  = (int32_t)((int64_t)exit_t * exit_t / MAX);
+    int32_t dx     = -(int32_t)((int64_t)(s_screen_w + 10) * eased / MAX);
+    set_text_x_delta(dx);
+    s_text_mid_done = false;
+  } else {
+    // Swap content once when layers are fully off-screen
+    if (!s_text_mid_done) {
+      s_text_mid_done = true;
+      apply_text_content();
+    }
+    // ENTER: Moook slide in from right with bounce at home
+    int32_t enter_t = (int32_t)((int64_t)(t - MOOOK_EXIT_THRESHOLD) * MAX
+                                / (MAX - MOOOK_EXIT_THRESHOLD));
+    set_text_x_delta(moook_enter_dx(enter_t, s_screen_w + 10));
+  }
+}
+
+static void text_anim_stopped(Animation *anim, bool finished, void *ctx) {
+  s_text_anim = NULL;
+  if (!s_text_mid_done) {
+    // Cancelled before midpoint — still need to apply the new content
+    apply_text_content();
+  }
+  set_text_x_delta(0);  // snap to home
+}
+
+static const AnimationImplementation s_text_anim_impl = {
+  .update = text_anim_update,
+};
+
+static void start_text_transition(void) {
+  if (s_text_anim) {
+    animation_unschedule(s_text_anim);  // fires stopped handler → s_text_anim = NULL
+  }
+  set_text_x_delta(0);
+  s_text_mid_done = false;
+
+  Animation *anim = animation_create();
+  animation_set_duration(anim, TEXT_TRANSITION_MS);
+  animation_set_curve(anim, AnimationCurveLinear);  // curve applied manually in update
+  animation_set_implementation(anim, &s_text_anim_impl);
+  animation_set_handlers(anim, (AnimationHandlers){ .stopped = text_anim_stopped }, NULL);
+  animation_schedule(anim);
+  s_text_anim = anim;
+}
+
+// ── Art layer ────────────────────────────────────────────────────────────
+
+static void set_art_x(int32_t x) {
+  if (!s_art_layer) return;
+  GRect r = s_art_home;
+  r.origin.x = x;
+  layer_set_frame(bitmap_layer_get_layer(s_art_layer), r);
+}
+
+static void apply_art_content(void) {
+  if (!s_art_layer) return;
+  bitmap_layer_set_bitmap(s_art_layer, s_art_pending_bmp);
+  layer_mark_dirty(bitmap_layer_get_layer(s_art_layer));
+  comm_release_old_art(); // old bitmap is no longer on screen; safe to free
+}
+
+static void art_anim_update(Animation *anim, const AnimationProgress progress) {
+  int32_t t   = (int32_t)progress;
+  int32_t MAX = ANIMATION_NORMALIZED_MAX;
+
+  if (t <= MOOOK_EXIT_THRESHOLD) {
+    int32_t exit_t = (MOOOK_EXIT_THRESHOLD > 0)
+                     ? (int32_t)((int64_t)t * MAX / MOOOK_EXIT_THRESHOLD) : MAX;
+    int32_t eased  = (int32_t)((int64_t)exit_t * exit_t / MAX);
+    int32_t x      = s_art_home.origin.x
+                     - (int32_t)((int64_t)(s_screen_w + 10) * eased / MAX);
+    set_art_x(x);
+    s_art_mid_done = false;
+  } else {
+    if (!s_art_mid_done) {
+      s_art_mid_done = true;
+      apply_art_content();
+    }
+    int32_t enter_t = (int32_t)((int64_t)(t - MOOOK_EXIT_THRESHOLD) * MAX
+                                / (MAX - MOOOK_EXIT_THRESHOLD));
+    set_art_x(s_art_home.origin.x + moook_enter_dx(enter_t, s_screen_w + 10));
+  }
+}
+
+static void art_anim_stopped(Animation *anim, bool finished, void *ctx) {
+  s_art_anim = NULL;
+  if (!s_art_mid_done) {
+    apply_art_content();
+  }
+  set_art_x(s_art_home.origin.x);  // snap to home
+}
+
+static const AnimationImplementation s_art_anim_impl = {
+  .update = art_anim_update,
+};
+
+static void start_art_transition(GBitmap *bmp) {
+  s_art_pending_bmp = bmp;  // set before unschedule so stopped handler sees latest bitmap
+  if (s_art_anim) {
+    animation_unschedule(s_art_anim);
+  }
+  set_art_x(s_art_home.origin.x);
+  s_art_mid_done = false;
+
+  Animation *anim = animation_create();
+  animation_set_duration(anim, ART_TRANSITION_MS);
+  animation_set_curve(anim, AnimationCurveLinear);
+  animation_set_implementation(anim, &s_art_anim_impl);
+  animation_set_handlers(anim, (AnimationHandlers){ .stopped = art_anim_stopped }, NULL);
+  animation_schedule(anim);
+  s_art_anim = anim;
+}
 
 static void marquee_stop_cb(void *data) {
   s_marquee_timer = NULL;
@@ -39,6 +300,8 @@ static void reset_marquee_timer(void) {
   }
 }
 
+// 8x8 shuffle/repeat icons — only used on rectangular displays.
+#if !defined(PBL_ROUND)
 // 8x8 shuffle icon — two crossing arrows, only drawn when shuffle is on.
 static void draw_shuffle_icon(GContext *ctx, int x, int y) {
   graphics_context_set_stroke_color(ctx, GColorWhite);
@@ -69,6 +332,7 @@ static void draw_repeat_icon(GContext *ctx, int x, int y, int state) {
     graphics_draw_pixel(ctx, GPoint(x + 2, y + 3));
   }
 }
+#endif // !PBL_ROUND
 
 static void overlay_update_proc(Layer *layer, GContext *ctx) {
   GRect bounds = layer_get_bounds(layer);
@@ -117,6 +381,18 @@ void ui_init(Window *window) {
   GRect bounds = layer_get_bounds(root);
   int W = bounds.size.w;
   int H = bounds.size.h;
+
+  // Seed buffers with defaults on very first open so dedup works correctly.
+  // On reopen these already hold the last known track — layers will be
+  // initialized to that text so the dedup check stays in sync.
+  if (!s_title_pending[0]) {
+    strncpy(s_title_pending, "Playback", sizeof(s_title_pending) - 1);
+    strncpy(s_artist_buf, "No track playing", sizeof(s_artist_buf) - 1);
+  }
+  // Keep display buffer in sync with incoming buffer so TextLayer init shows
+  // the right content.
+  strncpy(s_artist_display_buf, s_artist_buf, sizeof(s_artist_display_buf) - 1);
+  s_artist_display_buf[sizeof(s_artist_display_buf) - 1] = '\0';
 
 #if defined(PBL_ROUND)
   // Round layout (Chalk 180 / Gabbro 260): album art fills the entire
@@ -168,14 +444,14 @@ void ui_init(Window *window) {
   marquee_layer_set_font(s_title_shadow_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
   marquee_layer_set_text_color(s_title_shadow_layer, GColorBlack);
   marquee_layer_set_alignment(s_title_shadow_layer, GTextAlignmentCenter);
-  marquee_layer_set_text(s_title_shadow_layer, "Playback");
+  marquee_layer_set_text(s_title_shadow_layer, s_title_pending);
   layer_add_child(s_overlay_layer, marquee_layer_get_layer(s_title_shadow_layer));
 
   s_title_layer = marquee_layer_create(GRect(text_inset, title_y, text_w, title_h));
   marquee_layer_set_font(s_title_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
   marquee_layer_set_text_color(s_title_layer, GColorWhite);
   marquee_layer_set_alignment(s_title_layer, GTextAlignmentCenter);
-  marquee_layer_set_text(s_title_layer, "Playback");
+  marquee_layer_set_text(s_title_layer, s_title_pending);
   layer_add_child(s_overlay_layer, marquee_layer_get_layer(s_title_layer));
 
   // --- Artist (with shadow). Static text — no marquee, just ellipsize. ---
@@ -185,7 +461,7 @@ void ui_init(Window *window) {
   text_layer_set_font(s_artist_shadow_layer, fonts_get_system_font(FONT_KEY_GOTHIC_14));
   text_layer_set_text_alignment(s_artist_shadow_layer, GTextAlignmentCenter);
   text_layer_set_overflow_mode(s_artist_shadow_layer, GTextOverflowModeTrailingEllipsis);
-  text_layer_set_text(s_artist_shadow_layer, "No track");
+  text_layer_set_text(s_artist_shadow_layer, s_artist_display_buf);
   layer_add_child(s_overlay_layer, text_layer_get_layer(s_artist_shadow_layer));
 
   s_artist_layer = text_layer_create(GRect(text_inset, artist_y, text_w, artist_h));
@@ -194,7 +470,7 @@ void ui_init(Window *window) {
   text_layer_set_font(s_artist_layer, fonts_get_system_font(FONT_KEY_GOTHIC_14));
   text_layer_set_text_alignment(s_artist_layer, GTextAlignmentCenter);
   text_layer_set_overflow_mode(s_artist_layer, GTextOverflowModeTrailingEllipsis);
-  text_layer_set_text(s_artist_layer, "No track");
+  text_layer_set_text(s_artist_layer, s_artist_display_buf);
   layer_add_child(s_overlay_layer, text_layer_get_layer(s_artist_layer));
 
   // --- Progress bar (short, centered so it doesn't run into the curve) ---
@@ -238,7 +514,7 @@ void ui_init(Window *window) {
   marquee_layer_set_font(s_title_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
   marquee_layer_set_text_color(s_title_layer, GColorWhite);
   marquee_layer_set_alignment(s_title_layer, GTextAlignmentLeft);
-  marquee_layer_set_text(s_title_layer, "Playback");
+  marquee_layer_set_text(s_title_layer, s_title_pending);
   layer_add_child(s_overlay_layer, marquee_layer_get_layer(s_title_layer));
 
   s_artist_layer = text_layer_create(GRect(4, 21, W - 8, 18));
@@ -246,7 +522,7 @@ void ui_init(Window *window) {
   text_layer_set_text_color(s_artist_layer, GColorWhite);
   text_layer_set_font(s_artist_layer, fonts_get_system_font(FONT_KEY_GOTHIC_14));
   text_layer_set_overflow_mode(s_artist_layer, GTextOverflowModeTrailingEllipsis);
-  text_layer_set_text(s_artist_layer, "No track playing");
+  text_layer_set_text(s_artist_layer, s_artist_display_buf);
   layer_add_child(s_overlay_layer, text_layer_get_layer(s_artist_layer));
 
   s_progress_layer = layer_create(GRect(4, 39, W - 8, 4));
@@ -262,10 +538,28 @@ void ui_init(Window *window) {
 #endif
 
   snprintf(s_time_buf, sizeof(s_time_buf), "0:00 / 0:00");
+
+  // Capture home rects once so the transition functions can reference them
+  s_screen_w   = W;
+  s_title_home  = layer_get_frame(marquee_layer_get_layer(s_title_layer));
+  s_artist_home = layer_get_frame(text_layer_get_layer(s_artist_layer));
+  s_art_home    = layer_get_frame(bitmap_layer_get_layer(s_art_layer));
+#if defined(PBL_ROUND)
+  s_title_shadow_home  = layer_get_frame(marquee_layer_get_layer(s_title_shadow_layer));
+  s_artist_shadow_home = layer_get_frame(text_layer_get_layer(s_artist_shadow_layer));
+#endif
+
   reset_marquee_timer();
 }
 
 void ui_deinit(void) {
+  // Cancel any running transitions before destroying layers
+  if (s_text_anim) {
+    animation_unschedule(s_text_anim);  // stopped handler snaps layers to home
+  }
+  if (s_art_anim) {
+    animation_unschedule(s_art_anim);
+  }
   text_layer_destroy(s_time_layer);
   s_time_layer = NULL;
 #if defined(PBL_ROUND)
@@ -294,36 +588,84 @@ void ui_deinit(void) {
     app_timer_cancel(s_marquee_timer);
     s_marquee_timer = NULL;
   }
+  if (s_no_track_timer) {
+    app_timer_cancel(s_no_track_timer);
+    s_no_track_timer = NULL;
+  }
+  if (s_text_debounce_timer) {
+    app_timer_cancel(s_text_debounce_timer);
+    s_text_debounce_timer = NULL;
+  }
 }
 
 void ui_set_album_art(GBitmap *bitmap) {
   if (!s_art_layer) return;
-  bitmap_layer_set_bitmap(s_art_layer, bitmap);
-  layer_mark_dirty(bitmap_layer_get_layer(s_art_layer));
+  start_art_transition(bitmap);
 }
 
 void ui_set_status(const char *text) {
   (void)text; // Status is not shown in the Now Playing UI
 }
 
+static void text_debounce_cb(void *ctx) {
+  s_text_debounce_timer = NULL;
+  start_text_transition();
+}
+
+static void no_track_timeout_cb(void *ctx) {
+  s_no_track_timer = NULL;
+  if (s_track_received || !s_title_layer) return;
+  // Animate "No track playing" in from the right (against clean black background)
+  strncpy(s_title_pending, "Playback", sizeof(s_title_pending) - 1);
+  s_title_pending[sizeof(s_title_pending) - 1] = '\0';
+  strncpy(s_artist_buf, "No track playing", sizeof(s_artist_buf) - 1);
+  s_artist_buf[sizeof(s_artist_buf) - 1] = '\0';
+  start_text_transition();
+}
+
+void ui_start_loading(void) {
+  if (!s_title_layer) return;
+  if (s_text_debounce_timer) {
+    app_timer_cancel(s_text_debounce_timer);
+    s_text_debounce_timer = NULL;
+  }
+  // Blank both text layers immediately so the screen starts clean
+  s_title_pending[0] = '\0';
+  s_artist_buf[0] = '\0';
+  apply_text_content();
+  s_track_received = false;
+  if (s_no_track_timer) {
+    app_timer_cancel(s_no_track_timer);
+  }
+  s_no_track_timer = app_timer_register(NO_TRACK_TIMEOUT_MS, no_track_timeout_cb, NULL);
+}
+
 void ui_set_track_info(const char *title, const char *artist) {
-  strncpy(s_title_buf, title, sizeof(s_title_buf) - 1);
-  s_title_buf[sizeof(s_title_buf) - 1] = '\0';
+  // Cancel the loading timeout — real data has arrived
+  if (s_no_track_timer) {
+    app_timer_cancel(s_no_track_timer);
+    s_no_track_timer = NULL;
+  }
+  s_track_received = true;
+
+  bool changed = (strcmp(title, s_title_pending) != 0
+               || strcmp(artist, s_artist_buf) != 0);
+
+  strncpy(s_title_pending, title, sizeof(s_title_pending) - 1);
+  s_title_pending[sizeof(s_title_pending) - 1] = '\0';
   strncpy(s_artist_buf, artist, sizeof(s_artist_buf) - 1);
   s_artist_buf[sizeof(s_artist_buf) - 1] = '\0';
 
-  if (!s_title_layer) return;
-  marquee_layer_set_text(s_title_layer, s_title_buf);
-  text_layer_set_text(s_artist_layer, s_artist_buf);
-  layer_mark_dirty(text_layer_get_layer(s_artist_layer));
-#if defined(PBL_ROUND)
-  if (s_title_shadow_layer)  marquee_layer_set_text(s_title_shadow_layer, s_title_buf);
-  if (s_artist_shadow_layer) {
-    text_layer_set_text(s_artist_shadow_layer, s_artist_buf);
-    layer_mark_dirty(text_layer_get_layer(s_artist_shadow_layer));
+  if (!s_title_layer || !changed) return;
+
+  // Debounce: if two rapid updates arrive (e.g. title then artist as separate
+  // messages), batch them into a single animation.
+  if (s_text_debounce_timer) {
+    app_timer_reschedule(s_text_debounce_timer, TEXT_DEBOUNCE_MS);
+  } else {
+    s_text_debounce_timer = app_timer_register(TEXT_DEBOUNCE_MS,
+                                               text_debounce_cb, NULL);
   }
-#endif
-  reset_marquee_timer();
 }
 
 void ui_set_shuffle(bool on) {

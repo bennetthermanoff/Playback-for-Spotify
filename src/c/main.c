@@ -252,6 +252,7 @@ static void init(void) {
 
   if (launch_reason() == APP_LAUNCH_QUICK_LAUNCH) {
     now_playing_window_push();
+    ui_start_loading();
   }
 
   if (tutorial_needed()) {

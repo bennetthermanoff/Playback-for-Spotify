@@ -3,6 +3,7 @@
 static CommCallbacks s_callbacks;
 
 static GBitmap *s_art_bitmap = NULL;       // displayed (complete) art
+static GBitmap *s_art_bitmap_prev = NULL;  // previous art kept alive during transition
 static GBitmap *s_art_pending = NULL;      // in-progress incoming art
 static uint8_t *s_art_data = NULL;
 static uint32_t s_image_data_size = 0;
@@ -131,10 +132,12 @@ static void handle_image_chunk(DictionaryIterator *iter) {
   if (s_received_chunks >= s_total_chunks) {
     APP_LOG(APP_LOG_LEVEL_INFO, "Image complete! %lu bytes received",
             (unsigned long)s_bytes_received);
-    // Swap pending → displayed, discard the old art.
-    if (s_art_bitmap) {
-      gbitmap_destroy(s_art_bitmap);
+    // Keep old bitmap alive until ui.c finishes the exit-phase animation.
+    // comm_release_old_art() is called by ui.c at the animation midpoint.
+    if (s_art_bitmap_prev) {
+      gbitmap_destroy(s_art_bitmap_prev); // previous transition completed or was skipped
     }
+    s_art_bitmap_prev = s_art_bitmap;     // hand off; do NOT destroy yet
     s_art_bitmap = s_art_pending;
     s_art_pending = NULL;
     s_art_data = NULL;
@@ -315,11 +318,22 @@ void comm_init(CommCallbacks callbacks) {
   app_message_open(inbox, outbox);
 }
 
+void comm_release_old_art(void) {
+  if (s_art_bitmap_prev) {
+    gbitmap_destroy(s_art_bitmap_prev);
+    s_art_bitmap_prev = NULL;
+  }
+}
+
 void comm_deinit(void) {
   app_message_deregister_callbacks();
   if (s_art_pending) {
     gbitmap_destroy(s_art_pending);
     s_art_pending = NULL;
+  }
+  if (s_art_bitmap_prev) {
+    gbitmap_destroy(s_art_bitmap_prev);
+    s_art_bitmap_prev = NULL;
   }
   if (s_art_bitmap) {
     gbitmap_destroy(s_art_bitmap);
